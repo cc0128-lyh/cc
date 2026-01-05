@@ -1,0 +1,545 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebAR Cyber-Particles: 初晨</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: 'Courier New', sans-serif; }
+        canvas { display: block; }
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #00FFFF; font-size: 20px; text-align: center; pointer-events: none;
+            text-shadow: 0 0 15px #00FFFF; z-index: 10; letter-spacing: 2px;
+        }
+        #ui-layer {
+            position: absolute; bottom: 30px; left: 30px; 
+            color: rgba(255,255,255,0.7); pointer-events: none; 
+            font-size: 12px; line-height: 1.8;
+            text-shadow: 0 0 2px black;
+            border-left: 2px solid #00FFFF;
+            padding-left: 15px;
+        }
+        .highlight { color: #00FFFF; font-weight: bold; }
+        .red-text { color: #FF2255; font-weight: bold; }
+        .input_video { display: none; }
+    </style>
+</head>
+<body>
+
+    <div id="loading">SYSTEM INITIALIZING...<br><span style="font-size:12px; opacity:0.7;">ACCESSING NEURAL LINK</span></div>
+    
+    <div id="ui-layer">
+        <div>🖐 <span class="highlight">球体 (Sphere)</span></div>
+        <div>✌️ <span class="highlight">文字 (Text: 欣雨)</span></div>
+        <div>🤘 <span class="highlight">双螺旋 (DNA)</span> - <span style="font-size:10px">NEW!</span></div>
+        <div>☝️ <span class="highlight">星环 (Star)</span></div>
+        <div>👍 <span class="red-text">爱心 (Heart)</span></div>
+        <div>👌 <span class="highlight">黑洞引力 (Gravity)</span> - <span style="font-size:10px">HOLD IT!</span></div>
+    </div>
+    
+    <video class="input_video"></video>
+
+    <script src="https://unpkg.com/three@0.146.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://unpkg.com/@mediapipe/control_utils/control_utils.js"></script>
+    <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+
+    <script>
+        // --- 核心配置 ---
+        const CONFIG = {
+            count: 18000,          // 粒子数量增加到 1.8w
+            colorCyan: 0x00FFFF,   // 赛博青
+            colorRed: 0xFF0044,    // 霓虹红
+            colorWhite: 0xFFFFFF,  // 高亮白
+            cameraZ: 450,
+            stiffness: 0.04,       // 弹性 (回弹力度)
+            damping: 0.93,         // 阻尼 (顺滑度)
+            explosionForce: 20.0,  // 爆发力
+            noiseAmp: 3.0,         // 噪波振幅 (呼吸感强度)
+            gravityForce: 15.0     // 黑洞吸力
+        };
+
+        // 全局状态
+        let scene, camera, renderer, particles, geometry;
+        let positions, targets, velocities, colors, originalColors;
+        let time = 0;
+        
+        let currentShape = 'scatter';
+        let targetColorVec = new THREE.Color(CONFIG.colorCyan);
+        let currentColorVec = new THREE.Color(CONFIG.colorCyan);
+        
+        // 交互状态
+        let handState = {
+            detected: false,
+            position: new THREE.Vector3(),
+            velocity: new THREE.Vector3(),
+            prevPos: new THREE.Vector3(),
+            scale: 1.0,
+            targetScale: 1.0,
+            isPinching: false // 黑洞模式
+        };
+
+        // 形状缓存
+        const shapesCache = {};
+
+        // --- 1. 纹理生成 (让粒子带光晕) ---
+        function createGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 32; canvas.height = 32;
+            const context = canvas.getContext('2d');
+            const gradient = context.createRadialGradient(16, 16, 0, 16, 16, 16);
+            gradient.addColorStop(0, 'rgba(255,255,255,1)');
+            gradient.addColorStop(0.2, 'rgba(255,255,255,0.8)');
+            gradient.addColorStop(0.5, 'rgba(255,255,255,0.2)');
+            gradient.addColorStop(1, 'rgba(0,0,0,0)');
+            context.fillStyle = gradient;
+            context.fillRect(0, 0, 32, 32);
+            const texture = new THREE.Texture(canvas);
+            texture.needsUpdate = true;
+            return texture;
+        }
+
+        // --- 2. 初始化 ---
+        function init() {
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.0012); // 黑色迷雾
+
+            camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 1, 3000);
+            camera.position.z = CONFIG.cameraZ;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, powerPreference: "high-performance" });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // 限制像素比以优化性能
+            document.body.appendChild(renderer.domElement);
+
+            initParticles();
+            initShapes();
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            animate();
+        }
+
+        function initParticles() {
+            geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(CONFIG.count * 3);
+            targets = new Float32Array(CONFIG.count * 3);
+            velocities = new Float32Array(CONFIG.count * 3);
+            colors = new Float32Array(CONFIG.count * 3);
+            originalColors = new Float32Array(CONFIG.count * 3); // 存储当前的基础颜色（不含高亮）
+
+            const baseColor = new THREE.Color(CONFIG.colorCyan);
+
+            for (let i = 0; i < CONFIG.count; i++) {
+                // 初始散开
+                positions[i*3] = (Math.random()-0.5) * 1500;
+                positions[i*3+1] = (Math.random()-0.5) * 1000;
+                positions[i*3+2] = (Math.random()-0.5) * 1000;
+                
+                // 目标归零
+                targets[i*3] = 0; targets[i*3+1] = 0; targets[i*3+2] = 0;
+
+                colors[i*3] = baseColor.r;
+                colors[i*3+1] = baseColor.g;
+                colors[i*3+2] = baseColor.b;
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+            const material = new THREE.PointsMaterial({
+                size: 3.5,
+                map: createGlowTexture(), // 使用光晕纹理
+                vertexColors: true,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false,
+                transparent: true,
+                opacity: 0.9
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        // --- 3. 形状工厂 ---
+        const Shapes = {
+            scatter: () => {
+                const arr = new Float32Array(CONFIG.count * 3);
+                for (let i = 0; i < CONFIG.count; i++) {
+                    arr[i*3] = (Math.random()-0.5) * 1200;
+                    arr[i*3+1] = (Math.random()-0.5) * 1200;
+                    arr[i*3+2] = (Math.random()-0.5) * 1200;
+                }
+                return arr;
+            },
+            sphere: () => {
+                const arr = new Float32Array(CONFIG.count * 3);
+                for (let i = 0; i < CONFIG.count; i++) {
+                    const phi = Math.acos(-1 + (2 * i) / CONFIG.count);
+                    const theta = Math.sqrt(CONFIG.count * Math.PI) * phi;
+                    const r = 140;
+                    arr[i*3] = r * Math.cos(theta) * Math.sin(phi);
+                    arr[i*3+1] = r * Math.sin(theta) * Math.sin(phi);
+                    arr[i*3+2] = r * Math.cos(phi);
+                }
+                return arr;
+            },
+            dna: () => { // NEW: 双螺旋 DNA
+                const arr = new Float32Array(CONFIG.count * 3);
+                for (let i = 0; i < CONFIG.count; i++) {
+                    // 两条链
+                    const strand = i % 2 === 0 ? 1 : -1;
+                    const t = (i / CONFIG.count) * Math.PI * 12; // 圈数
+                    const r = 60;
+                    const h = 350; // 高度
+                    
+                    // 螺旋坐标
+                    let x = Math.cos(t) * r * strand;
+                    let z = Math.sin(t) * r * strand;
+                    let y = (i / CONFIG.count - 0.5) * h;
+
+                    // 加一点随机杂点作为基因键
+                    if (Math.random() > 0.8) {
+                        x *= Math.random();
+                        z *= Math.random();
+                    }
+
+                    arr[i*3] = x;
+                    arr[i*3+1] = y;
+                    arr[i*3+2] = z;
+                }
+                return arr;
+            },
+            star: () => {
+                const arr = new Float32Array(CONFIG.count * 3);
+                for(let i=0; i<CONFIG.count; i++) {
+                    const angle = (Math.floor(Math.random() * 5) * 72 * Math.PI / 180) - Math.PI/2;
+                    const dist = Math.random() * 160;
+                    // 增加Z轴厚度，更有体积感
+                    const spreadZ = (Math.random() - 0.5) * 60 * (1 - dist/160); 
+                    arr[i*3] = Math.cos(angle) * dist + (Math.random()-0.5)*10;
+                    arr[i*3+1] = Math.sin(angle) * dist + (Math.random()-0.5)*10;
+                    arr[i*3+2] = spreadZ;
+                }
+                return arr;
+            },
+            heart: () => {
+                const arr = new Float32Array(CONFIG.count * 3);
+                for (let i = 0; i < CONFIG.count; i++) {
+                    let t = Math.random() * Math.PI * 2;
+                    // 改进的心形填充算法
+                    let r = Math.pow(Math.random(), 0.3) * 10; 
+                    let x = 16 * Math.pow(Math.sin(t), 3);
+                    let y = 13 * Math.cos(t) - 5 * Math.cos(2*t) - 2 * Math.cos(3*t) - Math.cos(4*t);
+                    arr[i*3] = x * r;
+                    arr[i*3+1] = y * r + 20;
+                    arr[i*3+2] = (Math.random() - 0.5) * r * 4; // 根据半径加厚度
+                }
+                return arr;
+            },
+            text: () => {
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                canvas.width = 400; canvas.height = 200;
+                ctx.fillStyle = '#000'; ctx.fillRect(0, 0, 400, 200);
+                ctx.fillStyle = '#FFF'; 
+                ctx.font = '900 100px "Impact", sans-serif'; // 更粗的字体
+                ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+                ctx.fillText('欣雨', 200, 100);
+                
+                const data = ctx.getImageData(0,0,400,200).data;
+                const pixels = [];
+                for(let y=0; y<200; y+=2) {
+                    for(let x=0; x<400; x+=2) {
+                        if(data[(y*400+x)*4] > 128) {
+                            pixels.push({x: (x-200)*2.2, y: -(y-100)*2.2});
+                        }
+                    }
+                }
+                
+                const arr = new Float32Array(CONFIG.count * 3);
+                for(let i=0; i<CONFIG.count; i++) {
+                    const p = pixels[i % pixels.length];
+                    arr[i*3] = p.x + (Math.random()-0.5)*4;
+                    arr[i*3+1] = p.y + (Math.random()-0.5)*4;
+                    arr[i*3+2] = (Math.random()-0.5)*30;
+                }
+                return arr;
+            }
+        };
+
+        function initShapes() {
+            for (const key in Shapes) shapesCache[key] = Shapes[key]();
+            setShape('scatter', CONFIG.colorCyan, false);
+            // 初始直接对齐
+            for(let i=0; i<CONFIG.count*3; i++) positions[i] = targets[i];
+        }
+
+        function setShape(name, colorHex, explode = true) {
+            if (currentShape === name && !handState.isPinching) {
+                // 如果仅仅是颜色变了
+                targetColorVec.setHex(colorHex);
+                return;
+            }
+            
+            currentShape = name;
+            targetColorVec.setHex(colorHex);
+
+            const tArr = shapesCache[name];
+            for(let i=0; i<CONFIG.count*3; i++) targets[i] = tArr[i];
+
+            if (explode) {
+                for(let i=0; i<CONFIG.count; i++) {
+                    const idx = i*3;
+                    const amp = CONFIG.explosionForce;
+                    velocities[idx] += (Math.random()-0.5) * amp;
+                    velocities[idx+1] += (Math.random()-0.5) * amp;
+                    velocities[idx+2] += (Math.random()-0.5) * amp;
+                }
+            }
+        }
+
+        // --- 4. 物理引擎 (The Magic) ---
+        function updatePhysics() {
+            time += 0.01;
+            
+            // 颜色平滑
+            currentColorVec.lerp(targetColorVec, 0.05);
+            
+            // 手部状态计算
+            let stormForce = 0;
+            if (handState.detected) {
+                const speed = handState.velocity.length();
+                if (speed > 8) stormForce = speed * 4.0;
+                
+                // 缩放平滑
+                handState.scale += (handState.targetScale - handState.scale) * 0.1;
+            } else {
+                handState.scale += (1.0 - handState.scale) * 0.1;
+                handState.velocity.set(0,0,0);
+            }
+            
+            particles.scale.setScalar(handState.scale);
+            
+            // DNA 特效：如果当前是 DNA，让整体旋转
+            if (currentShape === 'dna') {
+                particles.rotation.y += 0.01;
+                particles.rotation.z = Math.sin(time * 0.5) * 0.1; // 微微倾斜
+            } else {
+                // 其他形状缓慢复位旋转
+                particles.rotation.y *= 0.95;
+                particles.rotation.z *= 0.95;
+            }
+
+            const positionsArr = geometry.attributes.position.array;
+            const colorsArr = geometry.attributes.color.array;
+
+            // 预计算黑洞中心 (将手部坐标转为 World Space 近似值)
+            // 假设手在 z=0 平面
+            const handX = handState.position.x;
+            const handY = handState.position.y;
+            const handZ = 0;
+
+            for (let i = 0; i < CONFIG.count; i++) {
+                const idx = i * 3;
+                
+                let px = positionsArr[idx];
+                let py = positionsArr[idx+1];
+                let pz = positionsArr[idx+2];
+                
+                let vx = velocities[idx];
+                let vy = velocities[idx+1];
+                let vz = velocities[idx+2];
+                
+                let tx = targets[idx];
+                let ty = targets[idx+1];
+                let tz = targets[idx+2];
+
+                // --- A. 基础弹簧力 ---
+                let ax = (tx - px) * CONFIG.stiffness;
+                let ay = (ty - py) * CONFIG.stiffness;
+                let az = (tz - pz) * CONFIG.stiffness;
+
+                // --- B. 量子噪波 (Living Field) ---
+                // 让粒子永远在动，模拟量子涨落
+                const noiseF = CONFIG.noiseAmp;
+                ax += Math.sin(time * 2.0 + py * 0.01) * 0.02 * noiseF;
+                ay += Math.cos(time * 1.5 + px * 0.01) * 0.02 * noiseF;
+                az += Math.sin(time * 1.8 + pz * 0.01) * 0.02 * noiseF;
+
+                // --- C. 交互力场 ---
+                if (handState.detected) {
+                    const dx = px - handX;
+                    const dy = py - handY;
+                    const dz = pz - handZ;
+                    const distSq = dx*dx + dy*dy + dz*dz;
+                    const dist = Math.sqrt(distSq) + 0.1;
+
+                    // 1. 黑洞引力 (Pinch)
+                    if (handState.isPinching) {
+                        // 强力吸入
+                        if (distSq < 250000) { // 500范围
+                            const gForce = CONFIG.gravityForce / (dist * 0.1); 
+                            ax -= (dx / dist) * gForce;
+                            ay -= (dy / dist) * gForce;
+                            az -= (dz / dist) * gForce;
+                        }
+                    } 
+                    // 2. 挥手风暴 (Wind)
+                    else if (stormForce > 10 && distSq < 40000) {
+                        const wForce = stormForce / dist;
+                        ax += (dx / dist) * wForce;
+                        ay += (dy / dist) * wForce;
+                        az += (dz / dist) * wForce;
+                    }
+                }
+
+                // 更新物理
+                vx += ax; vy += ay; vz += az;
+                vx *= CONFIG.damping; vy *= CONFIG.damping; vz *= CONFIG.damping;
+                
+                px += vx; py += vy; pz += vz;
+
+                positionsArr[idx] = px;
+                positionsArr[idx+1] = py;
+                positionsArr[idx+2] = pz;
+                
+                velocities[idx] = vx;
+                velocities[idx+1] = vy;
+                velocities[idx+2] = vz;
+
+                // --- D. 视觉特效：速度高亮 (Velocity Glow) ---
+                // 计算当前速度的标量
+                const speed = Math.sqrt(vx*vx + vy*vy + vz*vz);
+                
+                // 基础颜色插值
+                let r = currentColorVec.r;
+                let g = currentColorVec.g;
+                let b = currentColorVec.b;
+
+                // 如果速度快，叠加白色
+                if (speed > 2.0) {
+                    const glowFactor = Math.min((speed - 2.0) * 0.15, 1.0);
+                    r = r * (1 - glowFactor) + glowFactor; // 混入白色 (1.0, 1.0, 1.0)
+                    g = g * (1 - glowFactor) + glowFactor;
+                    b = b * (1 - glowFactor) + glowFactor;
+                }
+
+                colorsArr[idx] = r;
+                colorsArr[idx+1] = g;
+                colorsArr[idx+2] = b;
+            }
+
+            geometry.attributes.position.needsUpdate = true;
+            geometry.attributes.color.needsUpdate = true;
+        }
+
+        // --- 5. MediaPipe 处理 ---
+        const videoEl = document.querySelector('.input_video');
+        
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                handState.detected = true;
+                const lm = results.multiHandLandmarks[0];
+                
+                // 坐标映射
+                const x = (0.5 - lm[9].x) * window.innerWidth * 1.0;
+                const y = (0.5 - lm[9].y) * window.innerHeight * 1.0;
+                const currentPos = new THREE.Vector3(x, y, 0);
+                
+                // 计算手速
+                handState.velocity.subVectors(currentPos, handState.prevPos);
+                handState.prevPos.copy(currentPos);
+                handState.position.lerp(currentPos, 0.4); // 平滑位置
+
+                // 计算手掌大小 (缩放)
+                let minX=1, maxX=0, minY=1, maxY=0;
+                lm.forEach(p => {
+                    if(p.x<minX) minX=p.x; if(p.x>maxX) maxX=p.x;
+                    if(p.y<minY) minY=p.y; if(p.y>maxY) maxY=p.y;
+                });
+                const area = (maxX-minX)*(maxY-minY);
+                handState.targetScale = 0.5 + area * 4.0;
+
+                // 手势识别
+                analyzeGesture(lm);
+            } else {
+                handState.detected = false;
+            }
+        }
+
+        function analyzeGesture(lm) {
+            const isUp = (tip, pip) => {
+                // 简单向量判断，更稳健
+                return lm[tip].y < lm[pip].y; // 屏幕坐标 y 向下
+            };
+            const dist = (i, j) => Math.hypot(lm[i].x-lm[j].x, lm[i].y-lm[j].y);
+
+            const thumbUp = isUp(4, 3); // 拇指比较特殊的关节
+            const indexUp = isUp(8, 6);
+            const middleUp = isUp(12, 10);
+            const ringUp = isUp(16, 14);
+            const pinkyUp = isUp(20, 18);
+
+            // 黑洞判定：食指尖与拇指尖捏合 (Pinch)
+            const pinchDist = dist(4, 8);
+            if (pinchDist < 0.05) {
+                handState.isPinching = true;
+                setShape(currentShape, CONFIG.colorWhite, false); // 捏住时稍微变白
+                return; // 捏合时阻断其他手势
+            } else {
+                handState.isPinching = false;
+            }
+
+            let shape = currentShape;
+            let color = CONFIG.colorCyan;
+
+            // 逻辑树
+            const fingers = [thumbUp, indexUp, middleUp, ringUp, pinkyUp];
+            const upCount = fingers.filter(Boolean).length;
+
+            if (upCount === 5) {
+                shape = 'sphere'; // 张手
+            } else if (indexUp && middleUp && !ringUp && !pinkyUp) {
+                shape = 'text'; // 剪刀手
+            } else if (indexUp && !middleUp && !ringUp && !pinkyUp) {
+                shape = 'star'; // 食指
+            } else if (indexUp && !middleUp && !ringUp && pinkyUp) {
+                shape = 'dna'; // 🤘 Rock/Spider-Man -> DNA
+            } else if (thumbUp && !indexUp) {
+                shape = 'heart'; color = CONFIG.colorRed; // 竖大拇指
+            } else if (upCount === 0) {
+                shape = 'scatter'; // 握拳 -> 散开/圆环 (这里改为散开更有冲击力)
+            }
+
+            setShape(shape, color);
+        }
+
+        // --- 启动逻辑 ---
+        const hands = new Hands({locateFile: (file) => `https://unpkg.com/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.7, minTrackingConfidence: 0.6 });
+        hands.onResults(onResults);
+
+        const cam = new Camera(videoEl, {
+            onFrame: async () => await hands.send({image: videoEl}),
+            width: 640, height: 480
+        });
+        cam.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            updatePhysics();
+            renderer.render(scene, camera);
+        }
+
+        init();
+    </script>
+</body>
+</html>
